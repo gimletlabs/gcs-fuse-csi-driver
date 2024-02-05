@@ -178,7 +178,7 @@ func putExitFile(ctx context.Context, containerdClient *containerd.Client, pod *
 	// Check if the Pod is owned by a Job
 	isOwnedByJob := false
 	for _, o := range pod.ObjectMeta.OwnerReferences {
-		if o.Kind == "Job" {
+		if strings.HasSuffix(o.Kind, "Job") {
 			isOwnedByJob = true
 
 			break
