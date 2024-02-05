@@ -1,0 +1,3 @@
+imageregistry: "us-docker.pkg.dev/gimlet-dev-0/gimlet-dev-docker-artifacts"
+version: "v0.1.14"
+project: ""

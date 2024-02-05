@@ -1,0 +1,315 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gcs-fuse-csi-driver
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gcsfusecsi-node-sa
+  namespace: gcs-fuse-csi-driver
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gcs-fuse-csi-publisher-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+- apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - serviceaccounts
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gcs-fuse-csi-publisher-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gcs-fuse-csi-publisher-role
+subjects:
+- kind: ServiceAccount
+  name: gcsfusecsi-node-sa
+  namespace: gcs-fuse-csi-driver
+---
+apiVersion: v1
+data:
+  sidecar-image: {{.Values.imageregistry}}/gcs-fuse-csi-driver-sidecar-mounter:{{.Values.version}}
+kind: ConfigMap
+metadata:
+  name: gcsfusecsi-image-config
+  namespace: gcs-fuse-csi-driver
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gcs-fuse-csi-driver-webhook
+  namespace: gcs-fuse-csi-driver
+spec:
+  ports:
+  - name: injector
+    port: 443
+    protocol: TCP
+    targetPort: 22030
+  - name: metrics
+    port: 8080
+    protocol: TCP
+    targetPort: 22032
+  selector:
+    app: gcs-fuse-csi-driver-webhook
+---
+apiVersion: scheduling.k8s.io/v1
+description: This priority class should be used for the Cloud Storage FUSE CSI driver
+  node deployment only.
+globalDefault: false
+kind: PriorityClass
+metadata:
+  name: csi-gcp-gcs-node
+value: 900001000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcs-fuse-csi-driver-webhook
+  namespace: gcs-fuse-csi-driver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gcs-fuse-csi-driver-webhook
+  template:
+    metadata:
+      annotations:
+        seccomp.security.alpha.kubernetes.io/pod: runtime/default
+      labels:
+        app: gcs-fuse-csi-driver-webhook
+    spec:
+      containers:
+      - args:
+        - --sidecar-cpu-limit=250m
+        - --sidecar-cpu-request=250m
+        - --sidecar-memory-limit=256Mi
+        - --sidecar-memory-request=256Mi
+        - --sidecar-ephemeral-storage-limit=5Gi
+        - --sidecar-ephemeral-storage-request=5Gi
+        - --sidecar-image=$(SIDECAR_IMAGE)
+        - --sidecar-image-pull-policy=$(SIDECAR_IMAGE_PULL_POLICY)
+        - --cert-dir=/etc/tls-certs
+        - --port=22030
+        - --health-probe-bind-address=:22031
+        env:
+        - name: SIDECAR_IMAGE_PULL_POLICY
+          value: IfNotPresent
+        - name: SIDECAR_IMAGE
+          valueFrom:
+            configMapKeyRef:
+              key: sidecar-image
+              name: gcsfusecsi-image-config
+        image: {{.Values.imageregistry}}/gcs-fuse-csi-driver-webhook:{{.Values.version}}
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          httpGet:
+            path: /readyz
+            port: 22031
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 15
+        name: gcs-fuse-csi-driver-webhook
+        ports:
+        - containerPort: 22030
+          name: inject
+        - containerPort: 22031
+          name: readyz
+        resources:
+          limits:
+            cpu: 200m
+            memory: 200Mi
+          requests:
+            cpu: 10m
+            memory: 10Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /etc/tls-certs
+          name: gcs-fuse-csi-driver-webhook-certs
+          readOnly: true
+      securityContext:
+        runAsGroup: 2079
+        runAsUser: 2079
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+      - name: gcs-fuse-csi-driver-webhook-certs
+        secret:
+          secretName: gcs-fuse-csi-driver-webhook-secret
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gcsfusecsi-node
+  namespace: gcs-fuse-csi-driver
+spec:
+  selector:
+    matchLabels:
+      k8s-app: gcs-fuse-csi-driver
+  template:
+    metadata:
+      annotations:
+        seccomp.security.alpha.kubernetes.io/pod: runtime/default
+      labels:
+        k8s-app: gcs-fuse-csi-driver
+    spec:
+      containers:
+      - args:
+        - --v=5
+        - --endpoint=unix:/csi/csi.sock
+        - --nodeid=$(KUBE_NODE_NAME)
+        - --node=true
+        env:
+        - name: KUBE_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        image: {{.Values.imageregistry}}/gcs-fuse-csi-driver:{{.Values.version}}
+        imagePullPolicy: IfNotPresent
+        name: gcs-fuse-csi-driver
+        resources:
+          limits:
+            cpu: 200m
+            memory: 200Mi
+          requests:
+            cpu: 5m
+            memory: 10Mi
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /var/lib/kubelet/pods
+          mountPropagation: Bidirectional
+          name: kubelet-dir
+        - mountPath: /csi
+          name: socket-dir
+        - mountPath: /run/containerd/containerd.sock
+          name: cri-socket
+      - args:
+        - --v=5
+        - --csi-address=/csi/csi.sock
+        - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
+        env:
+        - name: DRIVER_REG_SOCK_PATH
+          value: /var/lib/kubelet/plugins/gcsfuse.csi.storage.gke.io/csi.sock
+        image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.2
+        imagePullPolicy: IfNotPresent
+        name: csi-driver-registrar
+        resources:
+          limits:
+            cpu: 50m
+            memory: 100Mi
+          requests:
+            cpu: 10m
+            memory: 10Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /csi
+          name: socket-dir
+        - mountPath: /registration
+          name: registration-dir
+      nodeSelector:
+        kubernetes.io/os: linux
+      priorityClassName: csi-gcp-gcs-node
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccount: gcsfusecsi-node-sa
+      tolerations:
+      - operator: Exists
+      volumes:
+      - hostPath:
+          path: /var/lib/kubelet/plugins_registry/
+          type: Directory
+        name: registration-dir
+      - hostPath:
+          path: /var/lib/kubelet/pods/
+          type: Directory
+        name: kubelet-dir
+      - hostPath:
+          path: /var/lib/kubelet/plugins/gcsfuse.csi.storage.gke.io/
+          type: DirectoryOrCreate
+        name: socket-dir
+      - hostPath:
+          path: /run/containerd/containerd.sock
+          type: Socket
+        name: cri-socket
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 10%
+    type: RollingUpdate
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: gcsfuse.csi.storage.gke.io
+spec:
+  attachRequired: false
+  fsGroupPolicy: None
+  podInfoOnMount: true
+  requiresRepublish: true
+  tokenRequests:
+  - audience: {{.Values.project}}.svc.id.goog
+  volumeLifecycleModes:
+  - Persistent
+  - Ephemeral
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: gcsfuse-sidecar-injector.csi.storage.gke.io
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    caBundle: ""
+    service:
+      name: gcs-fuse-csi-driver-webhook
+      namespace: gcs-fuse-csi-driver
+      path: /inject
+  failurePolicy: Ignore
+  matchPolicy: Equivalent
+  name: gcsfuse-sidecar-injector.csi.storage.gke.io
+  reinvocationPolicy: Never
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods
+    scope: Namespaced
+  sideEffects: None
+  timeoutSeconds: 3

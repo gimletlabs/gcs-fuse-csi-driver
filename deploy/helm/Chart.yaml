@@ -1,0 +1,6 @@
+---
+apiVersion: v2
+appVersion: 0.1.14
+description: A Helm chart for gcs-fuse-csi-driver
+name: gcs-fuse-csi-driver
+version: 0.1.14
